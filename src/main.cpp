@@ -4,6 +4,7 @@ This example uses FreeRTOS softwaretimers as there is no built-in Ticker library
 
 
 #include <WiFi.h>
+#include <WiFiMulti.h>
 extern "C" {
 	#include "freertos/FreeRTOS.h"
 	#include "freertos/timers.h"
@@ -13,6 +14,7 @@ extern "C" {
 #include <Update.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include <TinyGPS++.h>
 #include "../include/config.h"
 
 
@@ -25,10 +27,13 @@ IPAddress secondaryDNS(8, 8, 4, 4); //optional
 #define MQTT_HOST IPAddress(10, 1, 1, 201)
 #define MQTT_PORT 1883
 
+TinyGPSPlus gps; 
+HardwareSerial GPSSerial1(1);
 
 AsyncMqttClient mqttClient;
 TimerHandle_t mqttReconnectTimer;
 TimerHandle_t wifiReconnectTimer;
+TimerHandle_t GpsTimer;
 AsyncWebServer server(80);
 
 const char* PARAM_MESSAGE = "message";
@@ -129,13 +134,48 @@ void onMqttPublish(uint16_t packetId) {
   Serial.println(packetId);
 }
 
+static void smartDelay(unsigned long ms){
+  unsigned long start = millis();
+  do  {
+    while (GPSSerial1.available())
+      gps.encode(GPSSerial1.read());
+  } while (millis() - start < ms);
+}
+
+  void ShowGPSData() {
+    Serial.println(F("Checking GPS data..."));
+    smartDelay(1000);
+    if (gps.charsProcessed() < 10) {
+      Serial.println(F("No GPS data received: check wiring"));
+    }
+    Serial.print("Latitude  : ");
+    Serial.println(gps.location.lat(), 5);
+    Serial.print("Longitude : ");
+    Serial.println(gps.location.lng(), 4);
+    Serial.print("Satellites: ");
+    Serial.println(gps.satellites.value());
+    Serial.print("Altitude  : ");
+    Serial.print(gps.altitude.feet() / 3.2808);
+    Serial.println("M");
+    Serial.print("Time      : ");
+    Serial.print(gps.time.hour());
+    Serial.print(":");
+    Serial.print(gps.time.minute());
+    Serial.print(":");
+    Serial.println(gps.time.second());
+    Serial.println("**********************");    
+  }
+
+
 void setup() {
   Serial.begin(115200);
+  GPSSerial1.begin(9600, SERIAL_8N1, 12, 15); //17-TX 18-RX
   Serial.println();
   Serial.println();
 
   mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
   wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
+  GpsTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(20000), pdTRUE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(ShowGPSData));
 
   WiFi.onEvent(WiFiEvent);
 
@@ -163,6 +203,20 @@ void setup() {
       }
       request->send(200, "text/plain", "Hello, GET: " + message);
   });
+
+
+  server.on("/gps", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"latitude\":"+String(gps.location.lat(),5);
+    json += ",\"longitude\":"+String(gps.location.lng(),4);
+    json += ",\"satellites\":"+String(gps.satellites.value());    
+    json += ",\"time\":\""+String(gps.time.hour())+":"+String(gps.time.minute())+":"+String(gps.time.second())+"\"";    
+    json += ",\"Altitude\":"+String(gps.altitude.feet() / 3.2808)+"m";        
+    json += "}";
+    request->send(200, "application/json", json);
+    json = String();
+  });
+
 
   // Send a POST request to <IP>/post with a form field message set to <message>
   server.on("/post", HTTP_POST, [](AsyncWebServerRequest *request){
@@ -205,6 +259,7 @@ server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
   server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/html", "<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>");
   });
+
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
     AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", (Update.hasError())?"OK":"FAIL");
     response->addHeader("Connection", "close");
@@ -231,10 +286,13 @@ server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
     }
   });
 
-    if(!SPIFFS.begin()){
-      Serial.println("An Error has occurred while mounting SPIFFS");
-      return;
-    }
+  xTimerStart(GpsTimer, 1000);
+
+
+  if(!SPIFFS.begin(true)){
+    Serial.println("An Error has occurred while mounting SPIFFS");
+    return;
+  }
 
   server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.htm");
 
